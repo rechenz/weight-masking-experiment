@@ -107,6 +107,132 @@ def resnet18(num_classes=10, in_channels=3):
 
 
 # ============================================================================
+# 轻量模型 — SmallCNN（省电模式专用）
+# ============================================================================
+
+class SmallCNN(nn.Module):
+    """轻量 CNN，~250K 参数，GPU 负载只有 ResNet-18 的 1/40。"""
+    def __init__(self, in_channels=1, num_classes=10):
+        super().__init__()
+        self.net = nn.Sequential(
+            nn.Conv2d(in_channels, 32, 3, padding=1), nn.BatchNorm2d(32), nn.ReLU(),
+            nn.Conv2d(32, 64, 3, padding=1), nn.BatchNorm2d(64), nn.ReLU(), nn.MaxPool2d(2),
+            nn.Conv2d(64, 128, 3, padding=1), nn.BatchNorm2d(128), nn.ReLU(), nn.MaxPool2d(2),
+            nn.Conv2d(128, 256, 3, padding=1), nn.BatchNorm2d(256), nn.ReLU(),
+            nn.AdaptiveAvgPool2d(1),
+            nn.Flatten(),
+            nn.Linear(256, num_classes),
+        )
+
+    def forward(self, x):
+        return self.net(x)
+
+
+# ============================================================================
+# 小 Transformer — TinyViT（跟上时代）
+# ============================================================================
+
+class PatchEmbed(nn.Module):
+    """图像分块 + 线性投影。"""
+    def __init__(self, img_size=32, patch_size=4, in_chans=1, embed_dim=192):
+        super().__init__()
+        self.num_patches = (img_size // patch_size) ** 2
+        self.proj = nn.Conv2d(in_chans, embed_dim, kernel_size=patch_size, stride=patch_size)
+
+    def forward(self, x):
+        x = self.proj(x)  # [B, embed_dim, H/p, W/p]
+        x = x.flatten(2).transpose(1, 2)  # [B, num_patches, embed_dim]
+        return x
+
+
+class TransformerBlock(nn.Module):
+    def __init__(self, dim, heads, mlp_ratio=4, dropout=0.0):
+        super().__init__()
+        self.norm1 = nn.LayerNorm(dim)
+        self.attn = nn.MultiheadAttention(dim, heads, dropout=dropout, batch_first=True)
+        self.norm2 = nn.LayerNorm(dim)
+        self.mlp = nn.Sequential(
+            nn.Linear(dim, int(dim * mlp_ratio)),
+            nn.GELU(),
+            nn.Dropout(dropout),
+            nn.Linear(int(dim * mlp_ratio), dim),
+            nn.Dropout(dropout),
+        )
+        self.forward_dropout_rate = 0.0  # 运行时动态调整
+
+    def forward(self, x):
+        x = x + self.attn(self.norm1(x), self.norm1(x), self.norm1(x))[0]
+        x = x + F.dropout(self.mlp(self.norm2(x)),
+                          p=self.forward_dropout_rate, training=self.training)
+        return x
+
+
+class TinyViT(nn.Module):
+    """超轻量 ViT，适合 32x32 小图，~2.5M 参数。"""
+    def __init__(self, img_size=32, patch_size=4, in_channels=1, num_classes=10,
+                 embed_dim=192, depth=6, num_heads=6, mlp_ratio=4, dropout=0.0):
+        super().__init__()
+        self.patch_embed = PatchEmbed(img_size, patch_size, in_channels, embed_dim)
+        num_patches = self.patch_embed.num_patches
+        self.cls_token = nn.Parameter(torch.randn(1, 1, embed_dim))
+        self.pos_embed = nn.Parameter(torch.randn(1, num_patches + 1, embed_dim))
+        self.pos_drop = nn.Dropout(dropout)
+
+        self.blocks = nn.Sequential(*[
+            TransformerBlock(embed_dim, num_heads, mlp_ratio, dropout)
+            for _ in range(depth)
+        ])
+        self.norm = nn.LayerNorm(embed_dim)
+        self.head = nn.Linear(embed_dim, num_classes)
+        self.actnoise_std = 0.0  # 运行时动态调整
+
+        self._init_weights()
+
+    def set_dropout_rate(self, rate: float):
+        """动态调整所有 block 的 dropout 率。"""
+        for block in self.blocks:
+            block.forward_dropout_rate = rate
+
+    def set_actnoise_std(self, std: float):
+        """动态调整激活噪声幅度。"""
+        self.actnoise_std = std
+
+    def _init_weights(self):
+        nn.init.trunc_normal_(self.pos_embed, std=0.02)
+        nn.init.trunc_normal_(self.cls_token, std=0.02)
+        self.apply(lambda m: (nn.init.trunc_normal_(m.weight, std=0.02)
+                               if isinstance(m, (nn.Linear, nn.Conv2d)) else
+                               nn.init.constant_(m.bias, 0) if hasattr(m, "bias") and m.bias is not None else None))
+
+    def forward(self, x):
+        B = x.size(0)
+        x = self.patch_embed(x)  # [B, num_patches, embed_dim]
+        cls_tokens = self.cls_token.expand(B, -1, -1)
+        x = torch.cat([cls_tokens, x], dim=1)
+        x = x + self.pos_embed
+        x = self.pos_drop(x)
+        x = self.blocks(x)
+        x = self.norm(x)
+        x = x[:, 0]  # CLS token
+        # 激活噪声（在 head 之前加，影响最后的线性层输入）
+        if self.actnoise_std > 0 and self.training:
+            x = x + torch.randn_like(x) * self.actnoise_std
+        x = self.head(x)
+        return x
+
+
+def create_model(name: str, num_classes: int, in_channels: int) -> nn.Module:
+    if name == "resnet18":
+        return resnet18(num_classes, in_channels)
+    elif name == "smallcnn":
+        return SmallCNN(in_channels, num_classes)
+    elif name == "vit":
+        return TinyViT(in_channels=in_channels, num_classes=num_classes)
+    else:
+        raise ValueError(f"Unknown model: {name}")
+
+
+# ============================================================================
 # 权重 Mask 策略集合
 # ============================================================================
 
@@ -121,106 +247,85 @@ def get_weight_params(model: nn.Module, exclude_bias_bn: bool = True) -> List[to
     return params
 
 
-class MaskMode:
-    """存储 mask 模式标识符，方便产出文件名。"""
+# ============================================================================
+# 激活层约束策略（替代权重 mask）
+# ============================================================================
+
+class ConstraintMode:
+    """存储约束模式标识符。"""
     NONE = "none"            # Baseline: 正常训练
-    HARD_BERNOULLI = "hard"  # 硬 mask：随机把权重置 0
-    NOISE_GAUSS = "noise"    # 噪声注入：给权重加高斯噪声
-    STRUCTURED = "struct"    # 结构化 mask：按输出通道整组 mask
+    DROPOUT = "dropout"      # 阶段性高 dropout → 降低到 0
+    ACTNOISE = "actnoise"    # 激活值加高斯噪声 → 降低到 0
 
 
-class WeightMaskHook:
+class ActivationConstraint:
     """
-    训练 Hook：在 optimizer.step() 之后对权重施加 mask / 噪声。
+    训练期间对模型施加激活层约束（非权重层面）。
 
-    支持多种 mask 策略和 schedule。
+    通过调整模型的 dropout 率和激活噪声幅度，
+    模拟「感官/处理不成熟→逐渐健全」的过程。
     """
 
     def __init__(
         self,
-        model: nn.Module,
-        mode: str = "hard",
-        mask_ratio: float = 0.5,
+        model: TinyViT,
+        mode: str = "dropout",
+        max_rate: float = 0.5,
         total_epochs: int = 200,
-        mask_epochs: int = 100,
-        schedule: str = "step",
-        noise_std: float = 0.01,
+        constraint_epochs: int = 100,
+        schedule: str = "decay",
     ):
         self.model = model
         self.mode = mode
-        self.mask_ratio = mask_ratio
+        self.max_rate = max_rate
         self.total_epochs = total_epochs
-        self.mask_epochs = mask_epochs
+        self.constraint_epochs = constraint_epochs
         self.schedule = schedule
-        self.noise_std = noise_std
         self.current_epoch = 0
-        self.mask_steps = 0  # 累计 step 数
 
-        # 收集可 mask 的参数
-        self.target_params = get_weight_params(model)
-
-    def get_current_mask_ratio(self) -> float:
-        """根据 schedule 返回当前 epoch 的实际 mask 比例。"""
-        if self.current_epoch >= self.mask_epochs:
+    def get_current_rate(self) -> float:
+        """根据 schedule 返回当前 epoch 的实际约束强度。
+        返回 0~1 之间的值，对应 dropout 率或噪声幅度缩放。
+        """
+        if self.current_epoch >= self.constraint_epochs:
             return 0.0  # 后期全部放开
 
-        progress = self.current_epoch / max(self.mask_epochs, 1)
+        progress = self.current_epoch / max(self.constraint_epochs, 1)
 
         if self.schedule == "step":
-            # 分段常量：指定前 mask_epochs 固定比例
-            return self.mask_ratio
-        elif self.schedule == "linear":
-            # 线性衰减：从 mask_ratio 递减到 0
-            return self.mask_ratio * (1 - progress)
+            return self.max_rate
+        elif self.schedule in ("linear", "decay"):
+            return self.max_rate * (1 - progress)
         elif self.schedule == "cosine":
-            # 余弦衰减
-            return self.mask_ratio * 0.5 * (1 + np.cos(np.pi * progress))
+            return self.max_rate * 0.5 * (1 + np.cos(np.pi * progress))
         elif self.schedule == "inverse":
-            # 前期大比例，快速衰减
-            scale = max(0, 1 - progress ** 2)
-            return self.mask_ratio * scale
-        else:
-            return self.mask_ratio
+            return self.max_rate * max(0, 1 - progress ** 2)
+        elif self.schedule == "triangle":
+            start = 0.05
+            mid = 0.5
+            if progress <= mid:
+                p = progress / mid
+                return start + (self.max_rate - start) * p
+            else:
+                p = (progress - mid) / (1.0 - mid)
+                return self.max_rate * (1 - p)
+        return self.max_rate
 
-    def step(self):
-        """在 optimizer.step() 后调用，对权重施加 mask。"""
-        self.mask_steps += 1
-        ratio = self.get_current_mask_ratio()
-
-        if ratio <= 0:
+    def apply_constraint(self):
+        """在每个 batch 训练前调用，更新模型的约束参数。"""
+        rate = self.get_current_rate()
+        if rate <= 0:
+            self.model.set_dropout_rate(0.0)
+            self.model.set_actnoise_std(0.0)
             return
 
-        with torch.no_grad():
-            for p in self.target_params:
-                if p.grad is None:
-                    continue
-
-                if self.mode == "hard":
-                    # 硬 mask：Bernoulli 采样，将部分权重置 0
-                    mask = torch.bernoulli(
-                        torch.full_like(p, 1.0 - ratio)
-                    )
-                    p.data.mul_(mask)
-
-                elif self.mode == "noise":
-                    # 噪声注入：加高斯噪声（模拟"不精确"的信号传输）
-                    noise = torch.randn_like(p) * self.noise_std * ratio
-                    p.data.add_(noise)
-
-                elif self.mode == "struct":
-                    # 结构化 mask：按输出通道整体 mask
-                    if p.dim() == 4:  # conv weight: [out_c, in_c, k, k]
-                        out_c = p.size(0)
-                        mask = torch.bernoulli(
-                            torch.full((out_c, 1, 1, 1), 1.0 - ratio, device=p.device)
-                        )
-                        p.data.mul_(mask.expand_as(p))
-                    elif p.dim() == 2:  # linear weight: [out, in]
-                        out = p.size(0)
-                        mask = torch.bernoulli(
-                            torch.full((out, 1), 1.0 - ratio, device=p.device)
-                        )
-                        p.data.mul_(mask.expand_as(p))
+        if self.mode == "dropout":
+            self.model.set_dropout_rate(rate)
+            self.model.set_actnoise_std(0.0)
+        elif self.mode == "actnoise":
+            self.model.set_dropout_rate(0.0)
+            # 噪声 std 从 0 到 max_rate * 0.3
+            self.model.set_actnoise_std(rate * 0.3)
 
     def set_epoch(self, epoch: int):
         self.current_epoch = epoch
@@ -236,9 +341,11 @@ def train_epoch(
     criterion: nn.Module,
     optimizer: optim.Optimizer,
     device: torch.device,
-    mask_hook: Optional[WeightMaskHook] = None,
+    constraint: Optional[ActivationConstraint] = None,
     log_interval: int = 50,
     epoch: int = 0,
+    use_amp: bool = False,
+    scaler=None,
 ) -> Tuple[float, float]:
     """训练一个 epoch，返回 (avg_loss, accuracy)。"""
     model.train()
@@ -250,14 +357,23 @@ def train_epoch(
         inputs, targets = inputs.to(device), targets.to(device)
 
         optimizer.zero_grad()
-        outputs = model(inputs)
-        loss = criterion(outputs, targets)
-        loss.backward()
-        optimizer.step()
 
-        # 关键：在 optimizer step 后施加 mask
-        if mask_hook is not None:
-            mask_hook.step()
+        # 训练前施加激活层约束
+        if constraint is not None:
+            constraint.apply_constraint()
+
+        if use_amp:
+            with torch.amp.autocast(device_type="cuda"):
+                outputs = model(inputs)
+                loss = criterion(outputs, targets)
+            scaler.scale(loss).backward()
+            scaler.step(optimizer)
+            scaler.update()
+        else:
+            outputs = model(inputs)
+            loss = criterion(outputs, targets)
+            loss.backward()
+            optimizer.step()
 
         total_loss += loss.item() * inputs.size(0)
         _, predicted = outputs.max(1)
@@ -265,11 +381,11 @@ def train_epoch(
         correct += predicted.eq(targets).sum().item()
 
         if batch_idx % log_interval == 0:
+            cr = constraint.get_current_rate() if constraint else 0
             print(f"  [{epoch}][{batch_idx:3d}/{len(loader):3d}] "
                   f"loss: {loss.item():.4f} "
                   f"acc: {100. * correct / total:.2f}%"
-                  + (f" mask_ratio: {mask_hook.get_current_mask_ratio():.3f}"
-                     if mask_hook else ""))
+                  + (f" constraint: {cr:.3f}" if constraint else ""))
 
     avg_loss = total_loss / total
     accuracy = 100. * correct / total
@@ -329,36 +445,58 @@ def run_experiment(
     print(f"{'='*60}")
 
     # 初始化模型
-    model = resnet18(num_classes=10, in_channels=config.get("in_channels", 3)).to(device)
+    model = create_model(config.get("model", "resnet18"),
+                      num_classes=10,
+                      in_channels=config.get("in_channels", 3)).to(device)
     print(f"  模型参数量: {count_model_params(model):,}")
 
-    # 损失函数和优化器
+    # 损失函数和优化器 — 根据模型类型自动选择
     criterion = nn.CrossEntropyLoss()
-    optimizer = optim.SGD(
-        model.parameters(),
-        lr=config.get("lr", 0.1),
-        momentum=config.get("momentum", 0.9),
-        weight_decay=config.get("weight_decay", 5e-4),
-        nesterov=True,
-    )
-
-    # 学习率调度器
-    scheduler = optim.lr_scheduler.CosineAnnealingLR(
-        optimizer, T_max=config["epochs"], eta_min=1e-4
-    )
-
-    # 初始化 mask hook
-    mask_hook = None
-    if config["mask_mode"] != "none":
-        mask_hook = WeightMaskHook(
-            model=model,
-            mode=config["mask_mode"],
-            mask_ratio=config.get("mask_ratio", 0.5),
-            total_epochs=config["epochs"],
-            mask_epochs=config.get("mask_epochs", config["epochs"] // 2),
-            schedule=config.get("mask_schedule", "step"),
-            noise_std=config.get("noise_std", 0.01),
+    model_type = config.get("model", "resnet18")
+    if "vit" in model_type:
+        optimizer = optim.AdamW(
+            model.parameters(),
+            lr=config.get("lr", 1e-3),
+            weight_decay=config.get("weight_decay", 0.05),
         )
+    else:
+        optimizer = optim.SGD(
+            model.parameters(),
+            lr=config.get("lr", 0.1),
+            momentum=config.get("momentum", 0.9),
+            weight_decay=config.get("weight_decay", 5e-4),
+            nesterov=True,
+        )
+
+    # 学习率调度器 — ViT 加 warmup
+    if "vit" in model_type:
+        scheduler = optim.lr_scheduler.SequentialLR(
+            optimizer,
+            schedulers=[
+                optim.lr_scheduler.LinearLR(optimizer, start_factor=0.1, total_iters=10),
+                optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=config["epochs"] - 10, eta_min=1e-5),
+            ],
+            milestones=[10],
+        )
+    else:
+        scheduler = optim.lr_scheduler.CosineAnnealingLR(
+            optimizer, T_max=config["epochs"], eta_min=1e-4
+        )
+
+    # 初始化激活层约束（替代权重 mask）
+    constraint = None
+    if config["constraint_mode"] != "none":
+        constraint = ActivationConstraint(
+            model=model,
+            mode=config["constraint_mode"],
+            max_rate=config.get("max_rate", 0.5),
+            total_epochs=config["epochs"],
+            constraint_epochs=config.get("constraint_epochs", config["epochs"] // 2),
+            schedule=config.get("constraint_schedule", "decay"),
+        )
+
+    use_amp = config.get("amp", False)
+    scaler = torch.amp.GradScaler("cuda") if use_amp else None
 
     # 训练日志
     log = {
@@ -366,7 +504,7 @@ def run_experiment(
         "train_acc": [],
         "test_loss": [],
         "test_acc": [],
-        "mask_ratio": [],
+        "constraint_rate": [],
         "lr": [],
         "config": config,
     }
@@ -375,16 +513,16 @@ def run_experiment(
     best_state = None
 
     for epoch in range(1, config["epochs"] + 1):
-        if mask_hook is not None:
-            mask_hook.set_epoch(epoch)
+        if constraint is not None:
+            constraint.set_epoch(epoch)
 
         print(f"\n--- Epoch {epoch}/{config['epochs']} "
               f"| lr: {scheduler.get_last_lr()[0]:.6f} "
-              + (f"| mask_ratio: {mask_hook.get_current_mask_ratio() if mask_hook else 0:.3f}"))
+              + (f"| constraint: {constraint.get_current_rate() if constraint else 0:.3f}"))
 
         train_loss, train_acc = train_epoch(
             model, train_loader, criterion, optimizer, device,
-            mask_hook=mask_hook, epoch=epoch,
+            constraint=constraint, epoch=epoch, use_amp=use_amp, scaler=scaler,
         )
         test_loss, test_acc = evaluate(model, test_loader, criterion, device)
         scheduler.step()
@@ -393,7 +531,7 @@ def run_experiment(
         log["train_acc"].append(train_acc)
         log["test_loss"].append(test_loss)
         log["test_acc"].append(test_acc)
-        log["mask_ratio"].append(mask_hook.get_current_mask_ratio() if mask_hook else 0)
+        log["constraint_rate"].append(constraint.get_current_rate() if constraint else 0)
         log["lr"].append(scheduler.get_last_lr()[0])
 
         print(f"  >>> Train loss: {train_loss:.4f}  acc: {train_acc:.2f}%")
@@ -421,35 +559,36 @@ def draw_comparison(results: dict, save_dir: Path):
 
     colors = {
         "none": "#2196F3",
-        "hard": "#F44336",
-        "noise": "#4CAF50",
-        "struct": "#FF9800",
+        "dropout": "#F44336",
+        "actnoise": "#4CAF50",
     }
     labels = {
-        "none": "Baseline (Normal)",
-        "hard": "Hard Mask (Weight Zeroing)",
-        "noise": "Noise Injection (Gaussian)",
-        "struct": "Structured Mask (Channel-wise)",
+        "none": "Baseline",
+        "dropout": "Scheduled Dropout",
+        "actnoise": "Activation Noise",
     }
     linestyles = {
         "none": "-",
-        "hard": "--",
-        "noise": ":",
-        "struct": "-.",
+        "dropout": "--",
+        "actnoise": "-.",
     }
 
     for (name, log) in results.items():
-        color = colors.get(log["config"]["mask_mode"], "#666")
-        ls = linestyles.get(log["config"]["mask_mode"], "-")
-        label = labels.get(log["config"]["mask_mode"], name)
+        cmode = log["config"].get("constraint_mode", log["config"]["mask_mode"])
+        color = colors.get(cmode, "#666")
+        ls = linestyles.get(cmode, "-")
+        label = labels.get(cmode, name)
+        sched = log["config"].get("constraint_schedule", "")
+        if sched:
+            label += f" ({sched})"
         epochs = range(1, len(log["test_acc"]) + 1)
 
-        mask_epochs = log["config"].get("mask_epochs", log["config"]["epochs"] // 2)
+        constraint_epochs = log["config"].get("constraint_epochs", log["config"]["epochs"] // 2)
 
-        # 在图上画遮罩切换线
+        # 在图上画约束切换线
         for ax in axes.flat:
-            ax.axvline(x=mask_epochs, color="gray", linestyle="--",
-                       alpha=0.3, label="_mask_boundary")
+            ax.axvline(x=constraint_epochs, color="gray", linestyle="--",
+                       alpha=0.3, label="_constraint_boundary")
 
         # Test accuracy
         axes[0, 0].plot(epochs, log["test_acc"], color=color, ls=ls,
@@ -484,16 +623,20 @@ def draw_comparison(results: dict, save_dir: Path):
     axes[1, 1].legend(fontsize=9, loc="upper right")
     axes[1, 1].grid(True, alpha=0.3)
 
-    # 加一行 mask_ratio 和 lr 图
+    # constraint_rate 和 lr 图
     fig2, axes2 = plt.subplots(1, 2, figsize=(14, 4))
     for (name, log) in results.items():
-        color = colors.get(log["config"]["mask_mode"], "#666")
-        label = labels.get(log["config"]["mask_mode"], name)
-        epochs = range(1, len(log["mask_ratio"]) + 1)
-        axes2[0].plot(epochs, log["mask_ratio"], color=color, lw=2, label=label)
+        cmode = log["config"].get("constraint_mode", log["config"]["mask_mode"])
+        color = colors.get(cmode, "#666")
+        sched = log["config"].get("constraint_schedule", "")
+        label = labels.get(cmode, name)
+        if sched:
+            label += f" ({sched})"
+        epochs = range(1, len(log["constraint_rate"]) + 1)
+        axes2[0].plot(epochs, log["constraint_rate"], color=color, lw=2, label=label)
         axes2[1].plot(epochs, log["lr"], color=color, lw=2, label=label)
 
-    axes2[0].set_title("Mask Ratio (per epoch)", fontsize=13)
+    axes2[0].set_title("Constraint Rate (per epoch)", fontsize=13)
     axes2[0].set_xlabel("Epoch")
     axes2[0].legend(fontsize=9)
     axes2[0].grid(True, alpha=0.3)
@@ -505,9 +648,9 @@ def draw_comparison(results: dict, save_dir: Path):
 
     plt.tight_layout()
     fig.savefig(save_dir / "comparison_accuracy_loss.png", dpi=150, bbox_inches="tight")
-    fig2.savefig(save_dir / "mask_lr_schedule.png", dpi=150, bbox_inches="tight")
+    fig2.savefig(save_dir / "constraint_lr_schedule.png", dpi=150, bbox_inches="tight")
     print(f"  图片已保存: {save_dir}/comparison_accuracy_loss.png")
-    print(f"  图片已保存: {save_dir}/mask_lr_schedule.png")
+    print(f"  图片已保存: {save_dir}/constraint_lr_schedule.png")
     plt.close("all")
 
 
@@ -516,36 +659,45 @@ def draw_comparison(results: dict, save_dir: Path):
 # ============================================================================
 
 def main():
-    parser = argparse.ArgumentParser(description="Weight Masking Experiment")
-    parser.add_argument("--epochs", type=int, default=200,
-                        help="总训练 epoch 数 (默认: 200)")
-    parser.add_argument("--mask-epochs", type=int, default=None,
-                        help="前多少 epoch 施加 mask (默认: epochs//2)")
-    parser.add_argument("--mask-ratio", type=float, default=0.5,
-                        help="初始 mask 比例 (默认: 0.5)")
-    parser.add_argument("--batch-size", type=int, default=128,
-                        help="batch size (默认: 128)")
-    parser.add_argument("--lr", type=float, default=0.1,
-                        help="初始学习率 (默认: 0.1)")
+    parser = argparse.ArgumentParser(description="Activation Constraint Experiment")
+    parser.add_argument("--epochs", type=int, default=100,
+                        help="总训练 epoch 数 (默认: 100)")
+    parser.add_argument("--constraint-epochs", type=int, default=None,
+                        help="前多少 epoch 施加约束 (默认: epochs//2)")
+    parser.add_argument("--max-rate", type=float, default=0.5,
+                        help="最大约束强度 — dropout率/噪声幅度 (默认: 0.5)")
+    parser.add_argument("--batch-size", type=int, default=64,
+                        help="batch size (默认: 64)")
+    parser.add_argument("--lr", type=float, default=0.001,
+                        help="初始学习率 (默认: 0.001)")
     parser.add_argument("--seed", type=int, default=42,
                         help="随机种子 (默认: 42)")
     parser.add_argument("--workers", type=int, default=2,
                         help="DataLoader worker 数 (默认: 2)")
-    parser.add_argument("--skip-none", action="store_true",
-                        help="跳过 Baseline (none) 实验")
     parser.add_argument("--modes", type=str, nargs="+",
-                        choices=["none", "hard", "noise", "struct"],
-                        default=["none", "hard", "noise", "struct"],
-                        help="运行哪些 mask 模式 (默认: 全部)")
-    parser.add_argument("--schedule", type=str, default="step",
-                        choices=["step", "linear", "cosine", "inverse"],
-                        help="mask 衰减 schedule (默认: step)")
-    parser.add_argument("--noise-std", type=float, default=0.01,
-                        help="噪声注入标准差 (默认: 0.01)")
-    parser.add_argument("--dataset", type=str, default="cifar10",
+                        choices=["none", "dropout", "actnoise"],
+                        default=["none", "dropout", "actnoise"],
+                        help="约束模式 (默认: 全部)")
+    parser.add_argument("--schedules", type=str, nargs="+", default=["decay"],
+                        choices=["step", "linear", "decay", "cosine", "inverse", "triangle"],
+                        help="约束 schedule 列表 (默认: decay)")
+    parser.add_argument("--dataset", type=str, default="fashion_mnist",
                         choices=["cifar10", "fashion_mnist"],
-                        help="数据集 (默认: cifar10, fashion_mnist 更快下载)")
+                        help="数据集 (默认: fashion_mnist)")
+    parser.add_argument("--model", type=str, default="vit",
+                        choices=["resnet18", "smallcnn", "vit"],
+                        help="模型 (默认: vit)")
+    parser.add_argument("--amp", action="store_true",
+                        help="启用混合精度训练 (FP16)")
+    parser.add_argument("--light", action="store_true",
+                        help="轻量模式: epochs=50 + batch=64 + amp")
     args = parser.parse_args()
+
+    # --light 覆盖默认配置
+    if args.light:
+        if args.epochs == 100:
+            args.epochs = 50
+        args.amp = True
 
     # 固定随机种子
     torch.manual_seed(args.seed)
@@ -615,26 +767,25 @@ def main():
 
     # 显示实验配置
     epochs = args.epochs
-    mask_epochs = args.mask_epochs if args.mask_epochs else epochs // 2
+    constraint_epochs = args.constraint_epochs if args.constraint_epochs else epochs // 2
 
     base_config = {
         "epochs": epochs,
-        "mask_epochs": mask_epochs,
-        "mask_ratio": args.mask_ratio,
-        "mask_schedule": args.schedule,
-        "noise_std": args.noise_std,
+        "constraint_epochs": constraint_epochs,
+        "max_rate": args.max_rate,
         "lr": args.lr,
         "momentum": 0.9,
         "weight_decay": 5e-4,
         "batch_size": args.batch_size,
         "seed": args.seed,
         "dataset": args.dataset,
+        "model": args.model,
         "in_channels": in_channels,
-    }
+        "amp": args.amp,
 
     print(f"\n实验配置:")
-    print(f"  Epochs: {epochs} | Mask Epochs: {mask_epochs} | Mask Ratio: {args.mask_ratio}")
-    print(f"  Schedule: {args.schedule} | Noise Std: {args.noise_std}")
+    print(f"  Epochs: {epochs} | Constraint Epochs: {constraint_epochs} | Max Rate: {args.max_rate}")
+    print(f"  Schedules: {args.schedules} | Model: {args.model}")
     print(f"  Batch: {args.batch_size} | LR: {args.lr}")
     print(f"  模式: {args.modes}")
 
@@ -645,34 +796,51 @@ def main():
 
     # 运行实验
     results = {}
-    for mode in args.modes:
-        config = {**base_config, "name": f"mask_{mode}", "mask_mode": mode}
-        log = run_experiment(config, device, train_loader, test_loader, save_dir)
-        results[f"mask_{mode}"] = log
 
-        # 保存每个实验的日志
-        with open(save_dir / f"log_{mode}.json", "w") as f:
-            # 把 numpy 值转成 float
-            clean = {
-                k: (v if not isinstance(v, list) else
+    # 先跑一个 baseline（schedule 无关）
+    cfg = {**base_config, "name": "constraint_none", "constraint_mode": "none"}
+    log = run_experiment(cfg, device, train_loader, test_loader, save_dir)
+    results["mask_none"] = log
+    with open(save_dir / "log_none.json", "w") as f:
+        clean = {k: (v if not isinstance(v, list) else
                     [float(x) if not isinstance(x, (int, float)) else x for x in v])
-                for k, v in log.items() if k != "config"
-            }
-            clean["config"] = {
-                k: v for k, v in log["config"].items()
-                if isinstance(v, (str, int, float, bool))
-            }
-            json.dump(clean, f, indent=2)
+                for k, v in log.items() if k != "config"}
+        clean["config"] = {k: v for k, v in log["config"].items() if isinstance(v, (str, int, float, bool))}
+        json.dump(clean, f, indent=2)
 
-    # 画对比图
-    draw_comparison(results, save_dir)
+    # 再各个 schedule 跑 mask 实验
+    for schedule in args.schedules:
+        for mode in args.modes:
+            if mode == "none":
+                continue  # baseline 已经跑过了
+            name = f"constraint_{mode}_{schedule}"
+            cfg = {**base_config, "name": name, "constraint_mode": mode, "constraint_schedule": schedule}
+            log = run_experiment(cfg, device, train_loader, test_loader, save_dir)
+            results[name] = log
+            with open(save_dir / f"log_{mode}_{schedule}.json", "w") as f:
+                clean = {k: (v if not isinstance(v, list) else
+                            [float(x) if not isinstance(x, (int, float)) else x for x in v])
+                        for k, v in log.items() if k != "config"}
+                clean["config"] = {k: v for k, v in log["config"].items() if isinstance(v, (str, int, float, bool))}
+                json.dump(clean, f, indent=2)
+
+    # 画对比图 — 每个 schedule 一张
+    schedules_to_plot = ["none"] + args.schedules if args.schedules != ["none"] else ["none"]
+    for schedule in schedules_to_plot:
+        subset = {k: v for k, v in results.items()
+                  if schedule == "none" and "none" in k
+                  or schedule in k}
+        if len(subset) > 1:
+            draw_comparison(subset, save_dir)
 
     # 打印总结
     print(f"\n{'='*60}")
     print(f"  📊 实验总结")
     print(f"{'='*60}")
     for name, log in results.items():
-        label = labels_map.get(log["config"]["mask_mode"], name)
+        mode = log["config"]["constraint_mode"]
+        sched = log["config"].get("constraint_schedule", "none")
+        label = f"{mode:8s} ({sched})"
         print(f"  {label:20s} | Best Test Acc: {log['best_test_acc']:.2f}% | "
               f"Final: {log['final_test_acc']:.2f}%")
 

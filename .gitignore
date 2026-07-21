@@ -3,4 +3,8 @@ results_*/
 __pycache__/
 *.pyc
 *.pt
+*.txt
+*.code-workspace
+results_backup_*/
+patch.py
 .DS_Store
