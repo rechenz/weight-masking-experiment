@@ -40,7 +40,7 @@
 
 ##### 初步结果（权重 Mask 方案）
 
-![硬Mask + triangle 对比图](images\hard_triangle_result.png)
+![硬Mask + triangle 对比图](images/hard_triangle_result.png)
 
 - **Mask 期（epoch 1-24）：test acc 卡在 10%**——权重清零让梯度无法积累，模型学不动
 - **放开后（epoch 25+）：火箭起飞**，从 46% 追到 85.6%，但没追上 baseline（91%）
