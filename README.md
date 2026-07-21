@@ -19,6 +19,7 @@
 #### 实验设计
 
 ##### 模型
+
 - **TinyViT**（~270万参数，6层 Transformer，patch=4）
 - 训练集：FashionMNIST（6万张）
 
@@ -39,9 +40,8 @@
 
 ##### 初步结果（权重 Mask 方案）
 
-![硬Mask + triangle 对比图](images/hard_triangle_result.png)
+![硬Mask + triangle 对比图](images\hard_triangle_result.png)
 
 - **Mask 期（epoch 1-24）：test acc 卡在 10%**——权重清零让梯度无法积累，模型学不动
 - **放开后（epoch 25+）：火箭起飞**，从 46% 追到 85.6%，但没追上 baseline（91%）
-- **结论：权重层面操作对 Transformer 太暴力**，应改为激活值层面的约束（dropout / 噪声）
-
+- **结论：权重层面操作对 Transformer 太暴力**，应改为激活值层面的约束（dropout / 噪声），或者考虑是否存在代数方法将屏蔽的权重短路。
