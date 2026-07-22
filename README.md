@@ -112,9 +112,9 @@
 
 ##### 实验结果
 
-![实验过程acc对比](images\cifar10_comparison.png)
+![实验过程acc对比](images/cifar10_comparison.png)
 
-![实验结果对比](images\cifar10_bars.png)
+![实验结果对比](images/cifar10_bars.png)
 
 **区别上一次实验（FashionMNIST）：**
 
