@@ -51,9 +51,9 @@ def main() -> None:
     parser.add_argument("--workers", type=int, default=2,
                         help="DataLoader worker 数 (默认: 2)")
     parser.add_argument("--modes", type=str, nargs="+",
-                        choices=["none", "dropout", "actnoise"],
+                        choices=["none", "dropout", "actnoise", "subspace", "fixed_mask"],
                         default=["none", "dropout", "actnoise"],
-                        help="约束模式 (默认: 全部)")
+                        help="约束模式 (默认: none+dropout+actnoise)")
     parser.add_argument("--schedules", type=str, nargs="+", default=["decay"],
                         choices=["step", "linear", "decay",
                                  "cosine", "inverse", "triangle"],
@@ -183,11 +183,18 @@ def main() -> None:
     results = {}
 
     # 先跑一个 baseline（schedule 无关）
-    cfg = {**base_config, "name": "constraint_none", "constraint_mode": "none"}
-    log = run_experiment(cfg, device, train_loader, test_loader, save_dir)
-    results["mask_none"] = log
-    with open(save_dir / "log_none.json", "w", encoding="utf-8") as f:
-        json.dump(_convert_to_json_safe(log), f, indent=2, ensure_ascii=False)
+    # 如果 baseline 已有缓存，跳过训练
+    baseline_file = save_dir / "log_none.json"
+    if baseline_file.exists():
+        print(f"  📦 Baseline 已有缓存，跳过训练")
+        with open(baseline_file, "r", encoding="utf-8") as f:
+            results["mask_none"] = json.load(f)
+    else:
+        cfg = {**base_config, "name": "constraint_none", "constraint_mode": "none"}
+        log = run_experiment(cfg, device, train_loader, test_loader, save_dir)
+        results["mask_none"] = log
+        with open(save_dir / "log_none.json", "w", encoding="utf-8") as f:
+            json.dump(_convert_to_json_safe(log), f, indent=2, ensure_ascii=False)
 
     # 再各个 schedule 跑 mask 实验
     for schedule in args.schedules:

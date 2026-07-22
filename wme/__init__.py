@@ -19,6 +19,8 @@ from wme.models import (
     ConstraintModel,
 )
 from wme.constraint import ActivationConstraint
+from wme.subspace import SubspaceConstraint
+from wme.fixed_mask import FixedWeightMask
 from wme.training import train_epoch, evaluate, count_model_params
 from wme.utils import _convert_to_json_safe
 from wme.experiment import run_experiment, draw_comparison
@@ -29,6 +31,8 @@ __all__ = [
     "PatchEmbed", "TransformerBlock", "TinyViT",
     "create_model", "ConstraintModel",
     "ActivationConstraint",
+    "SubspaceConstraint",
+    "FixedWeightMask",
     "train_epoch", "evaluate", "count_model_params",
     "_convert_to_json_safe",
     "run_experiment", "draw_comparison",

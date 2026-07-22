@@ -12,6 +12,8 @@ import torch.optim as optim
 import torch.utils.data as data
 from wme.models import create_model
 from wme.constraint import ActivationConstraint
+from wme.subspace import SubspaceConstraint
+from wme.fixed_mask import FixedWeightMask
 from wme.training import train_epoch, evaluate, count_model_params
 
 
@@ -72,18 +74,39 @@ def run_experiment(
             optimizer, T_max=config["epochs"], eta_min=1e-4
         )
 
-    # 初始化激活层约束（替代权重 mask）
+    # 初始化约束
     constraint = None
-    if config["constraint_mode"] != "none":
-        constraint = ActivationConstraint(
-            model=model,
-            mode=config["constraint_mode"],
-            max_rate=config.get("max_rate", 0.5),
-            total_epochs=config["epochs"],
-            constraint_epochs=config.get(
-                "constraint_epochs", config["epochs"] // 2),
-            schedule=config.get("constraint_schedule", "decay"),
-        )
+    cmode = config["constraint_mode"]
+    if cmode != "none":
+        if cmode == "subspace":
+            constraint = SubspaceConstraint(
+                model=model,
+                max_rank_ratio=config.get("max_rate", 0.3),
+                total_epochs=config["epochs"],
+                constraint_epochs=config.get(
+                    "constraint_epochs", config["epochs"] // 2),
+                schedule=config.get("constraint_schedule", "decay"),
+            )
+        elif cmode == "fixed_mask":
+            constraint = FixedWeightMask(
+                model=model,
+                max_rate=config.get("max_rate", 0.5),
+                total_epochs=config["epochs"],
+                constraint_epochs=config.get(
+                    "constraint_epochs", config["epochs"] // 2),
+                schedule=config.get("constraint_schedule", "decay"),
+                seed=config.get("seed", 42),
+            )
+        else:
+            constraint = ActivationConstraint(
+                model=model,
+                mode=cmode,
+                max_rate=config.get("max_rate", 0.5),
+                total_epochs=config["epochs"],
+                constraint_epochs=config.get(
+                    "constraint_epochs", config["epochs"] // 2),
+                schedule=config.get("constraint_schedule", "decay"),
+            )
 
     use_amp = config.get("amp", False)
     scaler = torch.amp.GradScaler(device.type) if use_amp and device.type != "cpu" else None
@@ -156,16 +179,22 @@ def draw_comparison(results: dict, save_dir: Path, schedule_tag: str = "all") ->
         "none": "#2196F3",
         "dropout": "#F44336",
         "actnoise": "#4CAF50",
+        "subspace": "#FF9800",
+        "fixed_mask": "#9C27B0",
     }
     labels = {
         "none": "Baseline",
         "dropout": "Scheduled Dropout",
         "actnoise": "Activation Noise",
+        "subspace": "SVD Subspace (short-circuit)",
+        "fixed_mask": "Fixed Weight Mask",
     }
     linestyles = {
         "none": "-",
         "dropout": "--",
         "actnoise": "-.",
+        "subspace": ":",
+        "fixed_mask": "-",
     }
 
     # 先收集所有结果的约束切换线位置，只画一次

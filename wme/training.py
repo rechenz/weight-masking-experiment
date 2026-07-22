@@ -34,9 +34,10 @@ def train_epoch(
 
         optimizer.zero_grad()
 
-        # 训练前施加激活层约束
+        # 训练前施加约束
         if constraint is not None:
             constraint.apply_constraint()
+            has_restore = hasattr(constraint, 'restore_weights')
 
         if use_amp:
             assert scaler is not None
@@ -45,12 +46,20 @@ def train_epoch(
                 outputs = model(inputs)
                 loss = criterion(outputs, targets)
             scaler.scale(loss).backward()  # type: ignore[union-attr]
+            # 子空间约束：restore 原始权重后才 optimizer.step()
+            if constraint is not None and has_restore:
+                constraint.restore_weights()  # type: ignore[union-attr]
             scaler.step(optimizer)  # type: ignore[union-attr]
             scaler.update()  # type: ignore[union-attr]
         else:
             outputs = model(inputs)
             loss = criterion(outputs, targets)
             loss.backward()
+
+            # 子空间约束：restore 原始权重后才 optimizer.step()
+            if constraint is not None and has_restore:
+                constraint.restore_weights()  # type: ignore[union-attr]
+
             optimizer.step()
 
         total_loss += loss.item() * inputs.size(0)
