@@ -71,6 +71,8 @@
 
 ![激活值约束 + 权重短路对比](images/act_and_short_result.png)
 
+![准确率 vs Epoch](images/accuracy_vs_epoch.png)
+
 | 模式              | Best Test Acc | vs Baseline | 结论                                       |
 | ----------------- | ------------- | ----------- | ------------------------------------------ |
 | **Baseline**      | 88.59%        | —           | 正常发育，基线                             |
