@@ -3,21 +3,20 @@
 =================
 与 ActivationConstraint（每次随机）和 SubspaceConstraint（SVD 截断）不同，
 FixedWeightMask 在约束期开始时选择一个固定的权重子集进行 mask，
-整个约束期内 mask 不发生变化。
+整个约束期内 mask 集合只减不增（逐步解封）。
 
 对比意义：
 - vs 随机 mask（每 batch 重选）：固定 mask 让被保留的权重稳定积累梯度
 - vs dropout（激活级随机）：权重级固定短路 vs 激活级随机短路
 - vs subspace SVD（结构最优截断）：无结构硬截断 vs 基于本征结构的最优截断
 
-假设：
-- 被 mask 的权重虽然前向被清零，但反向能积累梯度
-- 解锁时它们已经"暗中发育"，不至于从零开始
-- 固定的"机能不全"比随机稳定性更好
+实现方式：直接 in-place mul_，无需 backup/restore。
+被 mask 的权重 = 0 → 梯度 = 0 → optimizer 不碰 → 解锁后从零开始发育。
 """
 
 import torch
 import torch.nn as nn
+import numpy as np
 from typing import Optional
 
 
@@ -25,7 +24,8 @@ class FixedWeightMask:
     """
     固定权重 mask：约束期开始时生成 mask，全程不变。
 
-    约束阶段结束后，mask 移除，所有权重正常训练。
+    使用 in-place weight.mul_(mask)，梯度自然通过 mask 传播。
+    无 backup/restore，避免梯度-权重错位导致的训练发散。
     """
 
     def __init__(
@@ -50,22 +50,23 @@ class FixedWeightMask:
             if isinstance(module, nn.Linear):
                 self._linear_layers.append((name, module))
 
-        # 为每个 Linear 层生成固定的二进制 mask
+        # 为每个 Linear 层生成固定的二进制 mask 并移到 GPU
         rng = torch.Generator()
         rng.manual_seed(seed)
-        self._masks: dict[str, torch.Tensor] = {}
+        self._masks: dict[str, torch.Tensor] = {}  # 全量 mask（50% zero）
+        self._masked_indices: dict[str, torch.Tensor] = {}  # mask 位置的有序列表
+        self._prev_rate: float = self.max_rate  # 上一 epoch 的 mask rate
+
         for name, layer in self._linear_layers:
             W = layer.weight.data
-            mask = torch.ones_like(W, device="cpu")
+            mask = torch.ones_like(W, device=W.device)
             n_total = mask.numel()
             n_mask = int(self.max_rate * n_total)
             if n_mask > 0:
                 indices = torch.randperm(n_total, generator=rng)[:n_mask]
                 mask.view(-1)[indices] = 0
+                self._masked_indices[name] = indices
             self._masks[name] = mask
-
-        # 权重备份
-        self._backup: dict[str, torch.Tensor] = {}
 
         print(f"  [FixedWeightMask] {len(self._linear_layers)} 个 Linear 层 | "
               f"mask_rate={self.max_rate:.0%} (固定)")
@@ -85,7 +86,6 @@ class FixedWeightMask:
         if self.current_epoch >= self.constraint_epochs:
             return 0.0
 
-        import numpy as np
         progress = self.current_epoch / max(self.constraint_epochs, 1)
 
         if self.schedule in ("linear", "decay"):
@@ -109,40 +109,33 @@ class FixedWeightMask:
 
     def apply_constraint(self) -> None:
         """
-        对权重施加固定 mask: W = W * mask。
-        mask 比例随 schedule 变化：
-        - step: 始终用原始 mask（固定 mask_rate）
-        - decay/linear: 按 schedule 降低 mask 比例，从全量 mask 中取子集
+        直接对权重施加 in-place mask: W = W * mask。
+        无 backup/restore —— optimizer 直接更新被 mask 的权重（梯度=0所以不动）。
+
+        mask 随 schedule 衰减：只解封新位置，已解封的不再 mask。
         """
         mask_rate = self._get_mask_rate()
-        if mask_rate <= 0:
-            return
+        if mask_rate <= 0 and self._prev_rate <= 0:
+            return  # 无约束且之前也无约束，跳过
 
         for name, layer in self._linear_layers:
-            full_mask = self._masks[name].to(layer.weight.device)
-            if mask_rate < self.max_rate - 1e-8:
-                # schedule 衰减: 只 mask full_mask 中前 mask_rate/max_rate 比例的 0
-                # 即渐进式"解封"被 mask 的权重
-                n_mask = int(mask_rate * full_mask.numel())
-                # 用 full_mask 中值为 0 的位置（即原始被 mask 的），只取前 n_mask 个保持 mask
-                zero_positions = (full_mask.view(-1) == 0).nonzero(as_tuple=True)[0]
-                keep_masked = zero_positions[:n_mask]
-                active_mask = torch.ones_like(full_mask.view(-1))
-                active_mask[keep_masked] = 0
-                active_mask = active_mask.view_as(full_mask)
+            full_mask = self._masks[name]  # 已在 GPU 上
+            if mask_rate <= 0:
+                # 约束结束，不再 mask
+                continue
+            if mask_rate >= self.max_rate - 1e-8:
+                # 全量 mask
+                layer.weight.data.mul_(full_mask)
             else:
-                active_mask = full_mask
+                # 渐进解封：从全量 mask 中取前 n_mask 个保持 mask
+                indices = self._masked_indices[name]
+                n_mask = int(mask_rate * full_mask.numel())
+                keep_masked = indices[:n_mask]
+                active_mask = torch.ones_like(full_mask)
+                active_mask.view(-1)[keep_masked] = 0
+                layer.weight.data.mul_(active_mask)
 
-            # 备份 + 施加
-            self._backup[name] = layer.weight.data.clone()
-            layer.weight.data.copy_(layer.weight.data * active_mask)
-
-    def restore_weights(self) -> None:
-        """恢复原始权重。在 backward 之后调用。"""
-        for name, layer in self._linear_layers:
-            if name in self._backup:
-                layer.weight.data.copy_(self._backup[name])
-        self._backup.clear()
+        self._prev_rate = mask_rate
 
     def set_epoch(self, epoch: int) -> None:
         """设置当前 epoch。"""

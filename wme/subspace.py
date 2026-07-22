@@ -7,9 +7,10 @@
 
 核心思路：
 - 每 epoch 对所有权重矩阵做 SVD 分解
-- 训练时用截断的低秩重建替代原始权重
-- 梯度通过截断权重反向传播，更新原始权重
+- 训练时用截断的低秩重建直接替代原始权重（in-place）
+- 无 backup/restore —— optimizer 直接更新截断后的权重
 - 下个 epoch 重新 SVD，反映权重更新
+- 约束阶段结束后，权重回到全秩，模型正常训练
 """
 
 import numpy as np
@@ -49,10 +50,8 @@ class SubspaceConstraint:
             if isinstance(module, nn.Linear):
                 self._linear_layers.append((name, module))
 
-        # 缓存 SVD 分解
+        # 缓存 SVD 分解（每 epoch 更新）
         self._svd_cache: dict[str, tuple[torch.Tensor, torch.Tensor, torch.Tensor]] = {}
-        # 原始权重备份（用于 restore）
-        self._backup: dict[str, torch.Tensor] = {}
 
         print(f"  [Subspace] 检测到 {len(self._linear_layers)} 个 Linear 层")
         self._update_svd()
@@ -62,7 +61,7 @@ class SubspaceConstraint:
         return "subspace"
 
     def get_current_rate(self) -> float:
-        """返回当前 rank 比率 (0~1)，对外展示用。"""
+        """返回当前 rank 比率 (0~1)。"""
         return self._get_rank_ratio()
 
     def _get_rank_ratio(self) -> float:
@@ -74,19 +73,14 @@ class SubspaceConstraint:
         min_ratio = 0.05  # 最低保留 5% rank
 
         if self.schedule in ("linear", "decay"):
-            # 从 min_ratio 线性增长到 1.0
             return min_ratio + (1.0 - min_ratio) * progress
         elif self.schedule == "cosine":
-            # 余弦退火风格：前期慢，后期快
             return min_ratio + (1.0 - min_ratio) * 0.5 * (1.0 - np.cos(np.pi * progress))
         elif self.schedule == "step":
-            # 台阶式：前半段低秩，后半段全秩
             return self.max_rank_ratio if progress < 0.5 else 1.0
         elif self.schedule == "inverse":
-            # 早期快速扩展
             return min_ratio + (1.0 - min_ratio) * (1.0 - (1.0 - progress) ** 3)
         elif self.schedule == "triangle":
-            # 三角形：快→慢→快
             mid = 0.5
             if progress <= mid:
                 p = progress / mid
@@ -104,13 +98,13 @@ class SubspaceConstraint:
                 U, S, Vh = torch.linalg.svd(W, full_matrices=False)
                 self._svd_cache[name] = (U, S, Vh)
             except Exception:
-                # 某些极端小矩阵 SVD 可能不稳定，跳过
+                # SVD 失败时保留旧缓存，跳过更新
                 pass
 
     def apply_constraint(self) -> None:
         """
-        将所有权重替换为截断 SVD 重建。
-        在训练 batch 前调用，实现"短路"效果。
+        将权重替换为截断 SVD 重建（in-place，无 restore）。
+        optimizer 直接更新截断后的权重。
         """
         rank_ratio = self._get_rank_ratio()
         if rank_ratio >= 1.0:
@@ -123,16 +117,8 @@ class SubspaceConstraint:
             k = max(1, int(len(S) * rank_ratio))
             # 截断重建: W_k = U[:,:k] @ diag(S[:k]) @ Vh[:k,:]
             W_trunc = (U[:, :k] * S[:k].unsqueeze(0)) @ Vh[:k, :]
-            # 备份原始权重
-            self._backup[name] = layer.weight.data.clone()
+            # 直接替换，无 backup/restore
             layer.weight.data.copy_(W_trunc.to(layer.weight.dtype))
-
-    def restore_weights(self) -> None:
-        """恢复原始权重。在 backward 之后、optimizer.step() 之前调用。"""
-        for name, layer in self._linear_layers:
-            if name in self._backup:
-                layer.weight.data.copy_(self._backup[name])
-        self._backup.clear()
 
     def set_epoch(self, epoch: int) -> None:
         """设置当前 epoch，触发 SVD 更新。"""
